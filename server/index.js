@@ -4,6 +4,8 @@ const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const fs = require("fs");
+const path = require("path");
 const db = require("./db");
 const mpesa = require("./services/mpesa");
 
@@ -17,6 +19,11 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret";
 
 app.get("/api/config", (req, res) => {
   res.json({ deductionRate: 0.1 });
+});
+
+// A quick root route so you can visually verify your backend is healthy on Render!
+app.get("/", (req, res) => {
+  res.send("Felix Microfinance Backend API Server is Live and Operational!");
 });
 
 const ALLOWED_ROLES = ["admin", "manager", "employer", "customer"];
@@ -106,18 +113,70 @@ function ensureAuth(req, res, next) {
   }
 }
 
-async function ensureUserApprovalColumn() {
+// Automatically runs your schema migrations if tables are completely missing
+async function initializeDatabaseSchema() {
   try {
+    // Check if users table already exists
+    const checkTable = await db.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'users'
+      );
+    `);
+
+    const tableExists = checkTable.rows[0].exists;
+
+    if (!tableExists) {
+      console.log(
+        "Database tables not found. Initializing schema from migration scripts...",
+      );
+
+      // Look for migration files inside db/migrations or server/db/migrations
+      const migrationPaths = [
+        path.join(__dirname, "../db/migrations/001_init.sql"),
+        path.join(__dirname, "./db/migrations/001_init.sql"),
+      ];
+
+      let migrationFile = null;
+      for (const p of migrationPaths) {
+        if (fs.existsSync(p)) {
+          migrationFile = p;
+          break;
+        }
+      }
+
+      if (migrationFile) {
+        const sqlSchema = fs.readFileSync(migrationFile, "utf8");
+        await db.query(sqlSchema);
+        console.log(
+          "Success: Database initial layout constructed successfully.",
+        );
+      } else {
+        console.warn(
+          "Migration file 001_init.sql could not be located automatically.",
+        );
+      }
+    }
+
+    // Now safely verify column structures
     await db.query(
       "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT TRUE",
     );
     await db.query("UPDATE users SET approved = TRUE WHERE approved IS NULL");
+    console.log(
+      "Database structural migration validation finished successfully.",
+    );
   } catch (err) {
-    console.warn("User approval migration check failed:", err.message);
+    console.warn(
+      "Database startup validation routine encountered an error:",
+      err.message,
+    );
   }
 }
 
-ensureUserApprovalColumn();
+// Kick off schema construction asynchronously on startup
+initializeDatabaseSchema();
 
 app.get("/api/auth/permissions", ensureAuth, (req, res) => {
   const headerRole = req.headers["x-impersonated-role"];
@@ -215,12 +274,32 @@ function findLoan(id) {
   return loanStore.find((l) => l.id === id);
 }
 
+// (Database dynamic logging for staging transactions fallback)
+async function initializeTransactionSchema() {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        loan_id VARCHAR(100),
+        user_id INTEGER,
+        type VARCHAR(100),
+        amount NUMERIC(12,2),
+        external_ref VARCHAR(255),
+        metadata JSONB,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+  } catch (e) {
+    console.warn("Backup transaction schema setup skipped:", e.message);
+  }
+}
+initializeTransactionSchema();
+
 function computeLoanPayload(P, d, n) {
   const Fdeduct = +(P * d).toFixed(2);
   const Adisburse = +(P - Fdeduct).toFixed(2);
   const Ltotal = +(P * (1 + d)).toFixed(2);
   const Rdaily = +(Ltotal / n).toFixed(2);
-  // Add aliases to match frontend expectation (totalPayable, dailyPayment)
   return {
     P,
     d,
@@ -281,7 +360,6 @@ app.get("/api/loans/user", ensureAuth, (req, res) => {
   res.json({ loans });
 });
 
-// Return pending_verification loans for manager verification queue
 app.get("/api/loans/pending-verification", ensureAuth, (req, res) => {
   if (req.user.role !== "manager") {
     return res.status(403).json({ error: "forbidden" });
@@ -292,7 +370,6 @@ app.get("/api/loans/pending-verification", ensureAuth, (req, res) => {
   res.json({ loans });
 });
 
-// Return pending_approval loans for admin disbursement
 app.get("/api/loans/pending-approval", ensureAuth, (req, res) => {
   if (req.user.role !== "admin") {
     return res.status(403).json({ error: "forbidden" });
@@ -301,7 +378,6 @@ app.get("/api/loans/pending-approval", ensureAuth, (req, res) => {
   res.json({ loans });
 });
 
-// Generic loans endpoint: admin/manager/employer see all loans, customer sees own
 app.get("/api/loans", ensureAuth, (req, res) => {
   if (["admin", "manager", "employer"].includes(req.user.role)) {
     return res.json({ loans: loanStore });
@@ -310,7 +386,6 @@ app.get("/api/loans", ensureAuth, (req, res) => {
   res.json({ loans });
 });
 
-// Register a payment/deduction against a loan so all portals see updated figures
 app.post("/api/loans/:id/pay", ensureAuth, (req, res) => {
   const { id } = req.params;
   const { amount, method = "manual", external_ref = null } = req.body;
@@ -322,7 +397,6 @@ app.post("/api/loans/:id/pay", ensureAuth, (req, res) => {
     return res.status(400).json({ error: "invalid amount" });
   }
 
-  // record transaction and update paidAmount/status
   const tx = {
     id: `TX${Date.now()}`,
     time: new Date().toISOString(),
@@ -343,11 +417,9 @@ app.post("/api/loans/:id/pay", ensureAuth, (req, res) => {
     loan.status = "repaying";
   }
 
-  // Respond with updated loan so frontends can refresh their views
   res.json({ loan });
 });
 
-// Manager verifies a loan account (pending_verification -> pending_approval)
 app.post("/api/loans/:id/verify", ensureAuth, (req, res) => {
   const headerRole = req.headers["x-impersonated-role"];
   const role = ALLOWED_ROLES.includes(headerRole) ? headerRole : req.user.role;
@@ -367,7 +439,6 @@ app.post("/api/loans/:id/verify", ensureAuth, (req, res) => {
   res.json({ loan });
 });
 
-// Manager rejects a loan account (pending_verification -> rejected)
 app.post("/api/loans/:id/reject", ensureAuth, (req, res) => {
   const headerRole = req.headers["x-impersonated-role"];
   const role = ALLOWED_ROLES.includes(headerRole) ? headerRole : req.user.role;
@@ -386,7 +457,6 @@ app.post("/api/loans/:id/reject", ensureAuth, (req, res) => {
   res.json({ loan });
 });
 
-// Admin disburses a loan (pending_approval -> disbursed)
 app.post("/api/loans/:id/decision", ensureAuth, (req, res) => {
   const headerRole = req.headers["x-impersonated-role"];
   const role = ALLOWED_ROLES.includes(headerRole) ? headerRole : req.user.role;
@@ -419,7 +489,7 @@ app.post("/api/loans/:id/decision", ensureAuth, (req, res) => {
   res.json({ loan });
 });
 
-// MPESA STK Push trigger (server-side request to Safaricom)
+// MPESA STK Push trigger
 app.post("/api/mpesa/stkpush", ensureAuth, async (req, res) => {
   try {
     const { phone, amount, accountRef, description } = req.body;
@@ -429,7 +499,6 @@ app.post("/api/mpesa/stkpush", ensureAuth, async (req, res) => {
       accountRef,
       description,
     });
-    // record initiation in transactions table
     try {
       await db.query(
         "INSERT INTO transactions(loan_id, user_id, type, amount, external_ref, metadata) VALUES($1,$2,$3,$4,$5,$6)",
@@ -452,7 +521,7 @@ app.post("/api/mpesa/stkpush", ensureAuth, async (req, res) => {
   }
 });
 
-// MPESA B2C Disbursement (admin to customer)
+// MPESA B2C Disbursement
 app.post("/api/mpesa/b2c", ensureAuth, async (req, res) => {
   const headerRole = req.headers["x-impersonated-role"];
   const role = ALLOWED_ROLES.includes(headerRole) ? headerRole : req.user.role;
@@ -465,11 +534,8 @@ app.post("/api/mpesa/b2c", ensureAuth, async (req, res) => {
       return res.status(400).json({ error: "missing phone or amount" });
     }
 
-    // In production, this would call M-Pesa B2C API
-    // For now, we'll simulate successful disbursement
     const disbursementRef = `B2C${Date.now()}`;
 
-    // Record disbursement transaction
     const loan = loanStore.find((l) => l.id === loanId);
     if (loan) {
       const tx = {
@@ -498,11 +564,10 @@ app.post("/api/mpesa/b2c", ensureAuth, async (req, res) => {
   }
 });
 
-// MPESA callback endpoint for STK and B2C
+// MPESA callback endpoint
 app.post("/api/mpesa/callback", (req, res) => {
   const ok = mpesa.verifyCallback(req);
   if (!ok) return res.status(403).json({ error: "verification failed" });
-  // persist callback payload
   (async () => {
     try {
       await db.query(
@@ -517,7 +582,7 @@ app.post("/api/mpesa/callback", (req, res) => {
   res.json({ result: "received" });
 });
 
-// Loan calc and persistence
+// Loan calc
 app.post("/api/loans/calc", ensureAuth, async (req, res) => {
   const { P, d, n } = req.body;
   const Fdeduct = +(P * d).toFixed(2);
