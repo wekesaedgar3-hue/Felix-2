@@ -1,0 +1,6 @@
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT TRUE;
+
+UPDATE users
+  SET approved = TRUE
+  WHERE approved IS NULL;

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: felix
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..10}; do pg_isready -h localhost && break; sleep 1; done
+
+      - name: Run migrations
+        env:
+          PG_CONN_STRING: postgres://postgres:postgres@localhost:5432/felix
+        run: npm run migrate
+
+      - name: Run tests
+        env:
+          PG_CONN_STRING: postgres://postgres:postgres@localhost:5432/felix
+          JWT_SECRET: ci-test-secret
+        run: npm test --silent
