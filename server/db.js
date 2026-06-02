@@ -8,7 +8,14 @@ const connString =
   process.env.PG_CONN_STRING ||
   `postgres://${process.env.PG_USER || "postgres"}:${process.env.PG_PASSWORD || "postgres"}@${process.env.PG_HOST || "127.0.0.1"}:${process.env.PG_PORT || 5432}/${process.env.PG_DATABASE || "felix"}`;
 
-const pool = new Pool({ connectionString: connString });
+// Determine if we need SSL (Required for Render production databases)
+const isProduction =
+  process.env.NODE_ENV === "production" || connString.includes("render.com");
+
+const pool = new Pool({
+  connectionString: connString,
+  ssl: isProduction ? { rejectUnauthorized: false } : false,
+});
 
 // Verify connection with retries to provide a clearer error when Postgres is down
 async function verifyConnection(retries = 5, delayMs = 2000) {
